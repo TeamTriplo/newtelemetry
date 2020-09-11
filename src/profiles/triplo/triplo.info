@@ -41,7 +41,6 @@ dependencies[] = backup_migrate
 dependencies[] = devel
 dependencies[] = dashboard_plus
 dependencies[] = googleanalytics
-dependencies[] = submitted_by
 dependencies[] = manualcrop
 dependencies[] = imagesloaded
 dependencies[] = imgareaselect
