@@ -1,0 +1,243 @@
+<?php
+/**
+ * @file
+ * Provides integration between Project module and GitHub.
+ */
+
+define('GITHUB_PROJECT_CREATED', 'created');
+define('GITHUB_PROJECT_EXISTS', 'exists');
+define('GITHUB_PROJECT_FAILED', FALSE);
+
+
+/**
+ * Implements hook_githubapi_payload().
+ */
+function project_github_githubapi_payload($event_name, $record, $repo) {
+  $payload = $record['data'];
+  module_load_include('inc', 'project_github', 'project_github.pages');
+  switch ($event_name) {
+    case 'push':
+      // Check if we even have a project that matches for making a release.
+      $project_node = project_github_load_project($payload['repository']['full_name']);
+      if (!$project_node || empty($project_node->project['github_sync_readme'])) {
+        return;
+      }
+      if (project_github_update_readme($project_node)) {
+        $project_node->save();
+      }
+    break;
+    case 'release':
+      $errors = array();
+      $project_node_result = NULL;
+      $package_result = _project_github_create_package($errors, $payload);
+      if ($package_result) {
+        $project_node_result = _project_github_create_project($errors, $payload);
+      }
+      // If a project node was created or already exists, create the release with
+      // package created above.
+      if ($project_node_result) {
+        $release_node_result = _project_github_create_project_release($errors, $payload);
+      }
+      // For better reporting for project authors who may not have access to the
+      // group-wide web hook settings, attempt to upload a report of the failures
+      // to the release as an asset.
+      if (!empty($errors)) {
+        _project_github_upload_error_log($errors, $payload);
+      }
+    break;
+
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for release node forms.
+ */
+function project_github_form_node_form_alter(&$form, &$form_state) {
+  $node = $form_state['node'];
+  if (project_node_is_project($node)) {
+    $form['project_github_path'] = array(
+      '#type' => 'textfield',
+      '#title' => t('GitHub path'),
+      '#field_prefix' => 'https://github.com/',
+      '#description' => t('The path is generally [owner]/[repo_name]. e.g. "backdrop-contrib/webform".'),
+      '#default_value' => $node->project['github_path'],
+      '#size' => 30,
+      '#parents' => array('project', 'github_path'),
+      '#weight' => -3,
+      '#element_validate' => array('project_github_validate_path_element'),
+    );
+    $form['project_github_sync_readme'] = array(
+      '#type' => 'radios',
+      '#title' => t('Project description'),
+      '#options' => array(
+        0 => t('Custom description'),
+        1 => t('Sync from GitHub README'),
+      ),
+      '#description' => t('If syncing from GitHub, the README md or txt file will be read from the default branch of the project. This value will be saved in the "body" field.'),
+      '#default_value' => $node->project['github_sync_readme'],
+      '#access' => isset($form['body']),
+      '#parents' => array('project', 'github_sync_readme'),
+      '#weight' => -1,
+      '#states' => array(
+        'invisible' => array(
+          '[name="project[github_path]"]' => array('value' => ''),
+        ),
+      ),
+    );
+    // Disable the body field if README syncing is enabled.
+    if (isset($form['body'])) {
+      $form['body'][LANGUAGE_NONE][0] += array(
+        '#states' => array(
+          'disabled' => array(
+            '[name="project[github_sync_readme]"]' => array('!value' => '0'),
+            '[name="project[github_path]"]' => array('!value' => ''),
+          ),
+        ),
+      );
+    }
+  }
+}
+
+/**
+ * Form API #element_validate callback. Ensure a GitHub path is unique.
+ */
+function project_github_validate_path_element($element, &$form_state) {
+  if (strlen($element['#value']) === 0) {
+    return;
+  }
+  $node = $form_state['node'];
+  $existing_project_node = project_github_load_project($element['#value']);
+  if ($existing_project_node && $existing_project_node->nid !== $node->nid) {
+    if (node_access('view', $existing_project_node)) {
+      $error = t('This GitHub path is already in use by the !title project.', array('!title' => l($existing_project_node->title, 'node/' . $existing_project_node->nid)));
+    }
+    else {
+      $error = t('This GitHub path is already in use by another project.');
+    }
+    form_error($element, $error);
+  }
+}
+
+/**
+ * Implements hook_field_extra_fields().
+ */
+function project_github_field_extra_fields() {
+  $form_additions = array(
+    'project_github_path' => array(
+      'label' => t('GitHub path'),
+      'description' => t('Textfield'),
+      'weight' => -3,
+    ),
+    'project_github_sync_readme' => array(
+      'label' => t('Sync README with GitHub'),
+      'description' => t('Radios'),
+      'weight' => -1,
+    ),
+  );
+
+  $extra = array();
+  $types = project_project_node_types();
+  foreach ($types as $type_name) {
+    $extra['node'][$type_name] = array(
+      'form' => $form_additions,
+
+      'display' => array(
+        'github_info' => array(
+          'label' => t('GitHub project info'),
+          'description' => t('Links to the github project page, issue queue, and wiki.'),
+          'weight' => 0,
+        ),
+      ),
+    );
+  }
+
+  return $extra;
+}
+
+/**
+ * Implements hook_node_prepare().
+ */
+function project_github_node_prepare(Node $node) {
+  if (project_node_is_project($node)) {
+    // Set default project values.
+    $node->project += array(
+      'github_path' => '',
+      'github_sync_readme' => 0,
+    );
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function project_github_node_presave(Node $node) {
+  if (project_node_is_project($node) && $node->project['github_sync_readme']) {
+    module_load_include('inc', 'project_github', 'project_github.pages');
+    project_github_update_readme($node);
+  }
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function project_github_node_view(Node $node, $view_mode, $langcode) {
+  if (project_node_is_project($node)) {
+    $node->content['github_info'] = array(
+      '#theme' => 'github_info',
+      '#github_path' => $node->project['github_path'],
+    );
+  }
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function project_github_block_info() {
+  $blocks['project_github'] = array(
+    'info' => t('GitHub project information'),
+    'description' => t('Links to the github project page, issue queue, and wiki.'),
+    'required contexts' => array('node' => 'node'),
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view();
+ */
+function project_github_block_view($delta = '', $settings = array(), $contexts = array()) {
+  $block = array();
+
+  switch ($delta) {
+    case 'project_github':
+      $block['subject'] = t('GitHub');
+      $block['content'] = array(
+        '#theme' => 'github_info',
+        '#github_path' => $contexts['node']->project['github_path'],
+      );
+      break;
+  }
+
+  return $block;
+}
+
+/**
+ * Load a project node based on its GitHub path.
+ */
+function project_github_load_project($github_path) {
+  $nid = db_query("SELECT nid FROM {project} WHERE github_path = :path", array(':path' => $github_path))->fetchField();
+  return $nid ? node_load($nid) : FALSE;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function project_github_theme($existing, $type, $theme, $path) {
+  return array(
+    'github_info' => array(
+      'variables' => array('github_path' => NULL),
+      'file' => 'project_github.theme.inc',
+    ),
+  );
+}
+
